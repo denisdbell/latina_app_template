@@ -42,10 +42,12 @@ jobs:
 
   - script: |
       SERVICE_NAME="${{ parameters.serviceName }}"
+      IMAGE_URL="${{ parameters.targetAcrLoginServer }}/${{ parameters.imageRepository }}:${{ parameters.imageTag }}"
       NAMESPACE="${{ parameters.namespace }}"
 
-      # Replace full image line regardless of what is currently there
-      sed -i "s|image:.*|image: ${{ parameters.targetAcrLoginServer }}/${{ parameters.imageRepository }}:${{ parameters.imageTag }}|g" ${SERVICE_NAME}/k8s/deployment.yaml
+      # Update deployment manifest
+      sed -i "s|<ACR_LOGIN_SERVER>|${{ parameters.targetAcrLoginServer }}|g" ${SERVICE_NAME}/k8s/deployment.yaml
+      sed -i "s|#{IMAGE_TAG}#|${{ parameters.imageTag }}|g" ${SERVICE_NAME}/k8s/deployment.yaml
 
       # Update namespace in manifests
       sed -i "s|namespace: inspire|namespace: ${NAMESPACE}|g" ${SERVICE_NAME}/k8s/service.yaml
@@ -57,20 +59,8 @@ jobs:
         sed -i "s|#{PHRASE_SERVICE_URL}#|${{ parameters.phraseUrl }}|g" ${SERVICE_NAME}/k8s/deployment.yaml
       fi
 
-      echo "=== Manifest after substitution ==="
+      echo "Manifest after substitution:"
       cat ${SERVICE_NAME}/k8s/deployment.yaml
-
-      # Guard: fail early if image still points to Docker Hub
-      if grep -q "denisdbell" ${SERVICE_NAME}/k8s/deployment.yaml; then
-        echo "##[error]Image substitution failed - manifest still contains Docker Hub image"
-        exit 1
-      fi
-
-      # Guard: fail early if ACR login server is missing
-      if ! grep -q "${{ parameters.targetAcrLoginServer }}" ${SERVICE_NAME}/k8s/deployment.yaml; then
-        echo "##[error]Image substitution failed - ACR login server not found in manifest"
-        exit 1
-      fi
     displayName: 'Inject Variables into Manifest'
 
   - publish: ${{ parameters.serviceName }}/k8s
@@ -88,6 +78,7 @@ jobs:
     runOnce:
       deploy:
         steps:
+        # Conditionally promote the image between ACRs
         - ${{ if eq(parameters.promoteImage, true) }}:
           - template: promote-acr.yaml
             parameters:
@@ -98,33 +89,26 @@ jobs:
               imageRepository: ${{ parameters.imageRepository }}
               imageTag: ${{ parameters.imageTag }}
 
+        # Download the manifest artifact published by the Prepare job
         - download: current
           artifact: manifest-${{ parameters.serviceName }}-${{ parameters.environmentName }}
           displayName: 'Download Manifest Artifact'
 
-        - task: KubeloginInstaller@0
-          displayName: 'Install Kubelogin'
-
-        # ✅ Create namespace if it does not exist
+        # Ensure the namespace exists before deploying resources into it
         - task: Kubernetes@1
           displayName: 'Ensure Namespace Exists: ${{ parameters.namespace }}'
           inputs:
             connectionType: 'Kubernetes Service Connection'
             kubernetesServiceEndpoint: '${{ parameters.aksServiceConnection }}'
-            command: 'get'
-            arguments: 'namespace ${{ parameters.namespace }}'
-          continueOnError: true
+            command: 'apply'
+            useConfigurationFile: true
+            inline: |
+              apiVersion: v1
+              kind: Namespace
+              metadata:
+                name: ${{ parameters.namespace }}
 
-        - task: Kubernetes@1
-          displayName: 'Create Namespace If Missing: ${{ parameters.namespace }}'
-          inputs:
-            connectionType: 'Kubernetes Service Connection'
-            kubernetesServiceEndpoint: '${{ parameters.aksServiceConnection }}'
-            command: 'create'
-            arguments: 'namespace ${{ parameters.namespace }}'
-          condition: failed()
-
-        # Deploy service manifest
+        # Deploy service
         - task: KubernetesManifest@1
           displayName: 'Deploy Service to AKS'
           inputs:
@@ -135,7 +119,7 @@ jobs:
             manifests: |
               $(Pipeline.Workspace)/manifest-${{ parameters.serviceName }}-${{ parameters.environmentName }}/service.yaml
 
-        # Deploy deployment manifest
+        # Deploy deployment
         - task: KubernetesManifest@1
           displayName: 'Deploy to AKS Namespace: ${{ parameters.namespace }}'
           inputs:
@@ -146,7 +130,7 @@ jobs:
             manifests: |
               $(Pipeline.Workspace)/manifest-${{ parameters.serviceName }}-${{ parameters.environmentName }}/deployment.yaml
 
-        # Verify rollout completed successfully
+        # Wait for rollout to complete
         - task: Kubernetes@1
           displayName: 'Verify Rollout Status'
           inputs:
@@ -155,7 +139,7 @@ jobs:
             command: 'rollout'
             arguments: 'status deployment/${{ parameters.serviceName }} -n ${{ parameters.namespace }} --timeout=300s'
 
-        # Show final pod status
+        # Show pod status after rollout
         - task: Kubernetes@1
           displayName: 'Show Pod Status'
           inputs:

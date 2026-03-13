@@ -31,7 +31,6 @@ steps:
     command: 'buildAndPush'
     Dockerfile: '${{ parameters.serviceName }}/Dockerfile'
     buildContext: '.'
-    arguments: '--platform linux/amd64'  # ✅ fixes platform mismatch on AKS
     tags: |
       $(Build.BuildId)
       latest

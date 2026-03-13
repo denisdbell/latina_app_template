@@ -1,0 +1,237 @@
+parameters:
+  - name: environmentName
+    type: string
+  - name: namespace
+    type: string
+  - name: aksServiceConnection
+    type: string
+  - name: targetAcrConnection
+    type: string
+  - name: targetAcrLoginServer
+    type: string
+  - name: imageRepository
+    type: string
+  - name: imageTag
+    type: string
+  - name: serviceName
+    type: string
+  - name: promoteImage
+    type: boolean
+    default: false
+  - name: sourceAcrConnection
+    type: string
+    default: ''
+  - name: sourceAcrLoginServer
+    type: string
+    default: ''
+  - name: imageUrl
+    type: string
+    default: ''
+  - name: phraseUrl
+    type: string
+    default: ''
+
+jobs:
+  # ── Deploy (Blue-Green): detect slot, prepare, deploy, switch ────────────────
+  - deployment: Deploy_${{ parameters.environmentName }}
+    displayName: Deploy to ${{ parameters.environmentName }} (Blue-Green)
+    environment: ${{ parameters.environmentName }}
+    pool:
+      vmImage: ubuntu-latest
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+            - checkout: self
+
+            # ── Optionally promote image between ACRs ──────────────────────────
+            - ${{ if eq(parameters.promoteImage, true) }}:
+              - template: promote-acr.yaml
+                parameters:
+                  sourceAcrConnection: ${{ parameters.sourceAcrConnection }}
+                  sourceAcrLoginServer: ${{ parameters.sourceAcrLoginServer }}
+                  targetAcrConnection: ${{ parameters.targetAcrConnection }}
+                  targetAcrLoginServer: ${{ parameters.targetAcrLoginServer }}
+                  imageRepository: ${{ parameters.imageRepository }}
+                  imageTag: ${{ parameters.imageTag }}
+
+            # ── Detect active slot via service connection ──────────────────────
+            # continueOnError: true handles first deployment where no service exists yet
+            - task: Kubernetes@1
+              displayName: Detect Active Slot
+              name: detectSlot
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: >-
+                  svc ${{ parameters.serviceName }}
+                  -n ${{ parameters.namespace }}
+                  -o jsonpath={.spec.selector.slot}
+              continueOnError: true
+
+            # ── Prepare manifests using detected slot ──────────────────────────
+            # KubectlOutput is passed as an env var to prevent the raw JSON
+            # (which contains shell-unsafe characters) from being evaluated as code
+            - bash: |
+                SERVICE_NAME="${{ parameters.serviceName }}"
+                NAMESPACE="${{ parameters.namespace }}"
+
+                # SLOT_OUTPUT is injected safely via env - never evaluated as bash
+                echo "Raw detected slot: [${SLOT_OUTPUT}]"
+                DETECT_OUTPUT=$(echo "${SLOT_OUTPUT}" | grep -oE '^(blue|green)$' | head -1 || echo "")
+                echo "Parsed slot: [${DETECT_OUTPUT}]"
+
+                # Default to blue on first deployment (no service exists yet)
+                ACTIVE_SLOT="blue"
+                if [ "${DETECT_OUTPUT}" = "blue" ] || [ "${DETECT_OUTPUT}" = "green" ]; then
+                  ACTIVE_SLOT="${DETECT_OUTPUT}"
+                fi
+
+                # Target slot is always the opposite of active
+                if [ "$ACTIVE_SLOT" = "blue" ]; then
+                  TARGET_SLOT="green"
+                else
+                  TARGET_SLOT="blue"
+                fi
+
+                echo "Active slot : ${ACTIVE_SLOT}"
+                echo "Target slot : ${TARGET_SLOT}"
+
+                # Expose for all subsequent steps in this job
+                echo "##vso[task.setvariable variable=targetSlot]${TARGET_SLOT}"
+                echo "##vso[task.setvariable variable=activeSlot]${ACTIVE_SLOT}"
+
+                # Substitute slot and image into deployment manifest
+                sed -i "s|#{SLOT}#|${TARGET_SLOT}|g"                                   ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+                sed -i "s|<ACR_LOGIN_SERVER>|${{ parameters.targetAcrLoginServer }}|g" ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+                sed -i "s|#{IMAGE_TAG}#|${{ parameters.imageTag }}|g"                  ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+
+                # Substitute namespace in manifests
+                sed -i "s|namespace: inspire|namespace: ${NAMESPACE}|g" ${SERVICE_NAME}/k8s/service.yaml
+                sed -i "s|namespace: inspire|namespace: ${NAMESPACE}|g" ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+
+                # Inject service URLs for frontend-service
+                if [ "$SERVICE_NAME" = "frontend-service" ]; then
+                  sed -i "s|#{IMAGE_SERVICE_URL}#|${{ parameters.imageUrl }}|g"   ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+                  sed -i "s|#{PHRASE_SERVICE_URL}#|${{ parameters.phraseUrl }}|g" ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+                fi
+
+                echo "Manifest after substitution:"
+                cat ${SERVICE_NAME}/k8s/deployment-bluegreen.yaml
+              displayName: Prepare Manifests
+              env:
+                SLOT_OUTPUT: $(detectSlot.KubectlOutput)
+
+            # ── Ensure namespace exists ────────────────────────────────────────
+            - task: Kubernetes@1
+              displayName: Ensure Namespace Exists - ${{ parameters.namespace }}
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: apply
+                useConfigurationFile: true
+                inline: |
+                  apiVersion: v1
+                  kind: Namespace
+                  metadata:
+                    name: ${{ parameters.namespace }}
+
+            # ── Deploy service manifest ────────────────────────────────────────
+            - task: KubernetesManifest@1
+              displayName: Deploy Service to AKS
+              inputs:
+                action: deploy
+                connectionType: kubernetesServiceConnection
+                kubernetesServiceConnection: ${{ parameters.aksServiceConnection }}
+                namespace: ${{ parameters.namespace }}
+                manifests: ${{ parameters.serviceName }}/k8s/service.yaml
+
+            # ── Deploy to inactive slot ────────────────────────────────────────
+            - task: KubernetesManifest@1
+              displayName: Deploy to $(targetSlot) Slot
+              inputs:
+                action: deploy
+                connectionType: kubernetesServiceConnection
+                kubernetesServiceConnection: ${{ parameters.aksServiceConnection }}
+                namespace: ${{ parameters.namespace }}
+                manifests: ${{ parameters.serviceName }}/k8s/deployment-bluegreen.yaml
+
+            # ── Wait for rollout ───────────────────────────────────────────────
+            - task: Kubernetes@1
+              displayName: Wait for Deployment Ready
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: rollout
+                arguments: >-
+                  status deployment/${{ parameters.serviceName }}-$(targetSlot)
+                  -n ${{ parameters.namespace }}
+                  --timeout=300s
+
+            # ── Verify pods are healthy ────────────────────────────────────────
+            - task: Kubernetes@1
+              displayName: Check Deployment Status
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: >-
+                  pods
+                  -n ${{ parameters.namespace }}
+                  -l app=${{ parameters.serviceName }},slot=$(targetSlot)
+
+            - task: Kubernetes@1
+              displayName: Verify Health Checks
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: >-
+                  pods
+                  -n ${{ parameters.namespace }}
+                  -l app=${{ parameters.serviceName }},slot=$(targetSlot)
+                  -o jsonpath={.items[*].status.conditions[?(@.type=="Ready")].status}
+
+            # ── Switch traffic to new slot ─────────────────────────────────────
+            - task: Kubernetes@1
+              displayName: Switch Service Selector to $(targetSlot)
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: patch
+                arguments: >-
+                  svc ${{ parameters.serviceName }}
+                  -n ${{ parameters.namespace }}
+                  -p "{\"spec\":{\"selector\":{\"app\":\"${{ parameters.serviceName }}\",\"slot\":\"$(targetSlot)\"}}}"
+
+            # ── Verify traffic switch ──────────────────────────────────────────
+            - task: Kubernetes@1
+              displayName: Verify Service Selector
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: >-
+                  svc ${{ parameters.serviceName }}
+                  -n ${{ parameters.namespace }}
+                  -o jsonpath={.spec.selector}
+
+            - task: Kubernetes@1
+              displayName: Verify Endpoints
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: endpoints ${{ parameters.serviceName }} -n ${{ parameters.namespace }}
+
+            - task: Kubernetes@1
+              displayName: Verify Traffic Routing
+              inputs:
+                connectionType: Kubernetes Service Connection
+                kubernetesServiceEndpoint: ${{ parameters.aksServiceConnection }}
+                command: get
+                arguments: >-
+                  pods
+                  -n ${{ parameters.namespace }}
+                  -l app=${{ parameters.serviceName }},slot=$(targetSlot)
